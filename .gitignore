@@ -1,0 +1,7 @@
+# Python cache files
+*.pyc
+
+__pycache__
+
+# Ignore generated YAML files
+k8s/*.yaml
