@@ -6,18 +6,22 @@ import base64
 class KubernetesResource:
     def __init__(self, name):
         self.name = name
+        self.metadata = {}
 
     def generate_yaml(self):
         raise NotImplementedError("Subclasses must implement generate_yaml method")
 
 class Deployment(KubernetesResource):
-    def __init__(self, name, image, replicas):
+    def __init__(self, microservice_name, name, image, replicas, related_resources=None):
         super().__init__(name)
         self.image = image
-        self.replicas = replicas
-        self.metadata = {}
+        self.replicas = replicas     
+        self.related_resources = related_resources   
+        self.microservice_name = microservice_name
 
     def generate_yaml(self):
+
+        
         deployment = {
             'apiVersion': 'apps/v1',
             'kind': 'Deployment',
@@ -26,22 +30,23 @@ class Deployment(KubernetesResource):
                 'replicas': self.replicas,
                 'selector': {
                     'matchLabels': {
-                        'app': f'microservice-{self.name}'
+                        'app': f'{self.name}'
                     }
                 },
                 'template': {
                     'metadata': {
                         'labels': {
-                            'app': f'microservice-{self.name}'
+                            'app': f'{self.name}'
                         }
                     },
                     'spec': {
                         'containers': [{
-                            'name': f'microservice-{self.name}',
+                            'name': f'{self.name}',
                             'image': self.image,
                             'ports': [{
                                 'containerPort': 8080
-                            }]
+                            }],
+                            'envFrom': self._related_resources()
                         }]
                     }
                 }
@@ -49,12 +54,19 @@ class Deployment(KubernetesResource):
         }
         return yaml.dump(deployment)
 
+    def _related_resources(self):        
+        env_from = []
+        for related  in self.related_resources:
+            if 'secret' in related:
+                secret_references = related.get("secret")
+                env_from.append({'secretRef': {'name': f'{self.microservice_name}-{secret_references}-secret'}})
+            return env_from
+
+
 class Service(KubernetesResource):
     def __init__(self, name, port):
         super().__init__(name)
-        self.metadata = {}
         self.port = port
-
 
     def generate_yaml(self):
         service = {
@@ -63,7 +75,7 @@ class Service(KubernetesResource):
             'metadata': self.metadata,
             'spec': {
                 'selector': {
-                    'app': f'microservice-{self.name}'
+                    'app': f'{self.name}'
                 },
                 'ports': [{
                     'protocol': 'TCP',
@@ -74,11 +86,21 @@ class Service(KubernetesResource):
         }
         return yaml.dump(service)
 
-class Namespace(KubernetesResource):
-    def __init__(self, name):
+class ConfigMap(KubernetesResource):
+    def __init__(self, name, data):
         super().__init__(name)
-        self.metadata = {}
+        self.data = data
 
+    def generate_yaml(self):
+        config_map = {
+            'apiVersion': 'v1',
+            'kind': 'ConfigMap',
+            'metadata': self.metadata,
+            'data': self.data
+        }
+        return yaml.dump(config_map)
+
+class Namespace(KubernetesResource):
     def generate_yaml(self):
         namespace = {
             'apiVersion': 'v1',
@@ -93,7 +115,6 @@ class Secret(KubernetesResource):
     def __init__(self, name, data):
         super().__init__(name)
         self.data = data
-        self.metadata = {}
 
     def generate_yaml(self):
         encoded_data = {key: base64.b64encode(value.encode('utf-8')).decode('utf-8') for key, value in self.data.items()}
@@ -101,7 +122,7 @@ class Secret(KubernetesResource):
             'apiVersion': 'v1',
             'kind': 'Secret',
             'metadata': {
-                'name': f'microservice-{self.name}'
+                'name': f'{self.name}'
             },
             'data': encoded_data
         }
@@ -110,47 +131,68 @@ class Secret(KubernetesResource):
 class KubernetesDeployer:
     def __init__(self, config):
         self.config = config
-        self.microservice_name = config['MICROSERVICE_NAME']
-        self.secrets = config.get('SECRETS', {})
+        self.microservice_name = config['MICROSERVICE_NAME']        
 
     def generate_resources(self):
         namespace = Namespace(f'namespace-{self.microservice_name}')
+        resources = [namespace]
 
-        resources = []
+        resource_map = {}
+
         for resource_config in self.config['resources']:
             component_name = resource_config['component_name']
             docker_image = resource_config['docker_image']
             replicas = resource_config['replicas']
+            config_data = resource_config.get('config', {})
             port = resource_config.get('port')
+            related_resources = resource_config.get('related_resources', [])
+        
+            deployment_name = f'{self.microservice_name}-{component_name}-deployment'
+            deployment = Deployment(self.microservice_name, deployment_name, docker_image, replicas, related_resources)
+            resources.append(deployment)
+            resource_map[component_name] = deployment
 
-            deployment = Deployment(f'{component_name}-deployment-{self.microservice_name}', docker_image, replicas)            
-            resources.extend([deployment])
 
+            # Service
             if port is not None:
-                service = Service(f'{component_name}-service-{self.microservice_name}', port)
+                service_name = f'{self.microservice_name}-{component_name}-service'
+                service = Service(service_name, port)
                 resources.append(service)
+                resource_map[f'{component_name}-service'] = service
 
+            # Secret
             if 'db_secrets' in resource_config:
                 secret_data = resource_config['db_secrets']
-                secret = Secret(f'{component_name}-secret-{self.microservice_name}', secret_data)
+                secret_name = f'{self.microservice_name}-{component_name}-secret'
+                secret = Secret(secret_name, secret_data)
                 resources.append(secret)
+                resource_map[f'{component_name}-secret'] = secret
 
-        # Asociar todos los recursos al mismo Namespace
+            # ConfigMap
+            if config_data:
+                config_map_name = f'{self.microservice_name}-{component_name}-config'
+                config_map = ConfigMap(config_map_name, config_data)
+                resources.append(config_map)
+                resource_map[f'{component_name}-config'] = config_map
+            
+
+        # Set namespace for all resources
         for resource in resources:
             resource.metadata['namespace'] = self.microservice_name
+            resource.metadata['name'] = f'{self.microservice_name}-{component_name}'
 
-        return [namespace] + resources
+
+        return resources
 
     def write_yaml_files(self, resources):
-        # Crear el directorio 'k8s' si no existe
         k8s_dir = 'k8s'
         if not os.path.exists(k8s_dir):
             os.makedirs(k8s_dir)
 
-        # Escribir archivos YAML en el directorio 'k8s'
         for resource in resources:
             with open(os.path.join(k8s_dir, f'{self.microservice_name}-{resource.name}.yaml'), 'w') as f:
                 f.write(resource.generate_yaml())
+
 
 if __name__ == "__main__":
     with open('config.json') as config_file:
